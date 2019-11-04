@@ -1,0 +1,826 @@
+From 69bc66835f266ca01c31368d4327f59089c122b8 Mon Sep 17 00:00:00 2001
+From: Lukas Larsson <lukas@erlang.org>
+Date: Tue, 29 Oct 2019 15:42:57 +0100
+Subject: [PATCH 3/6] erts: Move signal queue flags to own flag field in queue
+ struct
+
+We need to make space for more flags so we move all the
+flags that have something to do with the signal queue to
+a seperate flag field.
+---
+ erts/emulator/beam/erl_bif_info.c       |  16 +--
+ erts/emulator/beam/erl_gc.c             |  23 ++---
+ erts/emulator/beam/erl_message.c        |  32 +++---
+ erts/emulator/beam/erl_message.h        |   9 +-
+ erts/emulator/beam/erl_proc_sig_queue.c |  26 ++---
+ erts/emulator/beam/erl_process.c        |  11 ++-
+ erts/emulator/beam/erl_process.h        |  42 ++++----
+ erts/emulator/hipe/hipe_mode_switch.c   |  10 +-
+ erts/emulator/hipe/hipe_native_bif.c    |  12 +--
+ erts/etc/unix/etp-commands.in           | 123 ++++++++++++++++--------
+ 10 files changed, 174 insertions(+), 130 deletions(-)
+
+diff --git a/erts/emulator/beam/erl_bif_info.c b/erts/emulator/beam/erl_bif_info.c
+index b06b5fc1ab..01b40abe2d 100644
+--- a/erts/emulator/beam/erl_bif_info.c
++++ b/erts/emulator/beam/erl_bif_info.c
+@@ -1070,7 +1070,7 @@ process_info_bif(Process *c_p, Eterm pid, Eterm opt, int always_wrap, int pi2)
+     ERTS_CT_ASSERT(ERTS_PI_DEF_ARR_SZ > 0);
+ 
+     if (c_p->common.id == pid) {
+-        int local_only = c_p->flags & F_LOCAL_SIGS_ONLY;
++        int local_only = c_p->sig_qs.flags & FS_LOCAL_SIGS_ONLY;
+         int sres, sreds, reds_left;
+ 
+         reds_left = ERTS_BIF_REDS_LEFT(c_p);
+@@ -1088,7 +1088,7 @@ process_info_bif(Process *c_p, Eterm pid, Eterm opt, int always_wrap, int pi2)
+         reds_left -= sreds;
+ 
+         if (state & ERTS_PSFLG_EXITING) {
+-            c_p->flags &= ~F_LOCAL_SIGS_ONLY;
++            c_p->sig_qs.flags &= ~FS_LOCAL_SIGS_ONLY;
+             goto exited;
+         }
+         if (!sres | (reds_left <= 0)) {
+@@ -1097,11 +1097,11 @@ process_info_bif(Process *c_p, Eterm pid, Eterm opt, int always_wrap, int pi2)
+              * to yield and continue. Prevent fetching of
+              * more signals by setting local-sigs-only flag.
+              */
+-            c_p->flags |= F_LOCAL_SIGS_ONLY;
++            c_p->sig_qs.flags |= FS_LOCAL_SIGS_ONLY;
+             goto yield;
+         }
+ 
+-        c_p->flags &= ~F_LOCAL_SIGS_ONLY;
++        c_p->sig_qs.flags &= ~FS_LOCAL_SIGS_ONLY;
+     }
+ 
+     if (is_atom(opt)) {
+@@ -1760,7 +1760,7 @@ process_info_aux(Process *c_p,
+ 
+ 	total_heap_size += rp->mbuf_sz;
+ 
+-        if (rp->flags & F_ON_HEAP_MSGQ) {
++        if (rp->sig_qs.flags & FS_ON_HEAP_MSGQ) {
+             ErtsMessage *mp;
+             ASSERT(flags & ERTS_PI_FLAG_NEED_MSGQ_LEN);
+             for (mp = rp->sig_qs.first; mp; mp = mp->next) {
+@@ -1965,11 +1965,11 @@ process_info_aux(Process *c_p,
+     }
+ 
+     case ERTS_PI_IX_MESSAGE_QUEUE_DATA:
+-	switch (rp->flags & (F_OFF_HEAP_MSGQ|F_ON_HEAP_MSGQ)) {
+-	case F_OFF_HEAP_MSGQ:
++	switch (rp->sig_qs.flags & (FS_OFF_HEAP_MSGQ|FS_ON_HEAP_MSGQ)) {
++	case FS_OFF_HEAP_MSGQ:
+ 	    res = am_off_heap;
+ 	    break;
+-	case F_ON_HEAP_MSGQ:
++	case FS_ON_HEAP_MSGQ:
+ 	    res = am_on_heap;
+ 	    break;
+ 	default:
+diff --git a/erts/emulator/beam/erl_gc.c b/erts/emulator/beam/erl_gc.c
+index 111330539e..91a0aec121 100644
+--- a/erts/emulator/beam/erl_gc.c
++++ b/erts/emulator/beam/erl_gc.c
+@@ -416,7 +416,8 @@ erts_gc_after_bif_call_lhf(Process* p, ErlHeapFragment *live_hf_end,
+ {
+     int cost;
+ 
+-    if (p->flags & (F_HIBERNATE_SCHED|F_HIPE_RECV_LOCKED)) {
++    if ((p->flags & F_HIBERNATE_SCHED) ||
++        (p->sig_qs.flags & FS_HIPE_RECV_LOCKED)) {
+ 	/*
+ 	 * We just hibernated. We do *not* want to mess
+ 	 * up the hibernation by an ordinary GC...
+@@ -589,7 +590,7 @@ young_gen_usage(Process *p, Uint *ext_msg_usage)
+ 
+     hsz = p->mbuf_sz;
+ 
+-    if (p->flags & F_ON_HEAP_MSGQ) {
++    if (p->sig_qs.flags & FS_ON_HEAP_MSGQ) {
+         ERTS_FOREACH_SIG_PRIVQS(
+             p, mp,
+             {
+@@ -654,7 +655,7 @@ check_for_possibly_long_gc(Process *p, Uint ygen_usage)
+ 
+     sz = ygen_usage;
+     sz += p->hend - p->stop;
+-    if (p->flags & F_ON_HEAP_MSGQ)
++    if (p->sig_qs.flags & FS_ON_HEAP_MSGQ)
+         sz += erts_proc_sig_privqs_len(p);
+     if (major)
+ 	sz += p->old_htop - p->old_heap;
+@@ -1467,7 +1468,7 @@ minor_collection(Process* p, ErlHeapFragment *live_hf_end,
+         do_minor(p, live_hf_end, (char *) mature, mature_size*sizeof(Eterm),
+ 		 new_sz, objv, nobj);
+ 
+-	if (p->flags & F_ON_HEAP_MSGQ)
++	if (p->sig_qs.flags & FS_ON_HEAP_MSGQ)
+ 	    move_msgs_to_heap(p);
+ 
+ 	new_mature = p->old_htop - prev_old_htop;
+@@ -1852,7 +1853,7 @@ major_collection(Process* p, ErlHeapFragment *live_hf_end,
+ 
+     HIGH_WATER(p) = HEAP_TOP(p);
+ 
+-    if (p->flags & F_ON_HEAP_MSGQ)
++    if (p->sig_qs.flags & FS_ON_HEAP_MSGQ)
+ 	move_msgs_to_heap(p);
+ 
+     ErtsGcQuickSanityCheck(p);
+@@ -2592,12 +2593,12 @@ setup_rootset(Process *p, Eterm *objv, int nobj, Rootset *rootset)
+ 
+     ASSERT(n <= rootset->size);
+ 
+-    switch (p->flags & (F_OFF_HEAP_MSGQ|F_OFF_HEAP_MSGQ_CHNG)) {
+-    case F_OFF_HEAP_MSGQ|F_OFF_HEAP_MSGQ_CHNG:
++    switch (p->sig_qs.flags & (FS_OFF_HEAP_MSGQ|FS_OFF_HEAP_MSGQ_CHNG)) {
++    case FS_OFF_HEAP_MSGQ|FS_OFF_HEAP_MSGQ_CHNG:
+ 	(void) erts_move_messages_off_heap(p);
+-    case F_OFF_HEAP_MSGQ:
++    case FS_OFF_HEAP_MSGQ:
+ 	break;
+-    case F_OFF_HEAP_MSGQ_CHNG:
++    case FS_OFF_HEAP_MSGQ_CHNG:
+     case 0: {
+         Sint len;
+ 	/*
+@@ -3205,7 +3206,7 @@ offset_message(ErtsMessage *mp, Sint offs, char* area, Uint area_size)
+ static void
+ offset_mqueue(Process *p, Sint offs, char* area, Uint area_size)
+ {
+-    if ((p->flags & (F_OFF_HEAP_MSGQ|F_OFF_HEAP_MSGQ_CHNG)) != F_OFF_HEAP_MSGQ)
++    if ((p->sig_qs.flags & (FS_OFF_HEAP_MSGQ|FS_OFF_HEAP_MSGQ_CHNG)) != FS_OFF_HEAP_MSGQ)
+         ERTS_FOREACH_SIG_PRIVQS(p, mp, offset_message(mp, offs, area, area_size));
+ }
+ 
+@@ -3439,7 +3440,7 @@ erts_process_gc_info(Process *p, Uint *sizep, Eterm **hpp,
+         values[6] = htop - heap;
+     }
+ 
+-    if (p->flags & F_ON_HEAP_MSGQ) {
++    if (p->sig_qs.flags & FS_ON_HEAP_MSGQ) {
+         /* If on heap messages in the internal queue are counted
+            as being part of the heap, so we have to add them to the
+            am_mbuf_size value. process_info(total_heap_size) should
+diff --git a/erts/emulator/beam/erl_message.c b/erts/emulator/beam/erl_message.c
+index 1bebf6efe2..7901aa668c 100644
+--- a/erts/emulator/beam/erl_message.c
++++ b/erts/emulator/beam/erl_message.c
+@@ -913,7 +913,7 @@ erts_move_messages_off_heap(Process *c_p)
+ 
+     ASSERT(erts_atomic32_read_nob(&c_p->state)
+ 	   & ERTS_PSFLG_OFF_HEAP_MSGQ);
+-    ASSERT(c_p->flags & F_OFF_HEAP_MSGQ_CHNG);
++    ASSERT(c_p->sig_qs.flags & FS_OFF_HEAP_MSGQ_CHNG);
+ 
+     for (i = 0; i < sizeof(msgq)/sizeof(msgq[0]); i++) {
+         ErtsMessage *mp;
+@@ -983,7 +983,7 @@ erts_complete_off_heap_message_queue_change(Process *c_p)
+     int reds = 1;
+ 
+     ERTS_LC_ASSERT(ERTS_PROC_LOCK_MAIN == erts_proc_lc_my_proc_locks(c_p));
+-    ASSERT(c_p->flags & F_OFF_HEAP_MSGQ_CHNG);
++    ASSERT(c_p->sig_qs.flags & FS_OFF_HEAP_MSGQ_CHNG);
+     ASSERT(erts_atomic32_read_nob(&c_p->state) & ERTS_PSFLG_OFF_HEAP_MSGQ);
+ 
+     /*
+@@ -995,7 +995,7 @@ erts_complete_off_heap_message_queue_change(Process *c_p)
+      * consistent with that.
+      */
+ 
+-    if (!(c_p->flags & F_OFF_HEAP_MSGQ))
++    if (!(c_p->sig_qs.flags & FS_OFF_HEAP_MSGQ))
+ 	erts_atomic32_read_band_nob(&c_p->state,
+ 					~ERTS_PSFLG_OFF_HEAP_MSGQ);
+     else {
+@@ -1005,7 +1005,7 @@ erts_complete_off_heap_message_queue_change(Process *c_p)
+ 	erts_proc_unlock(c_p, ERTS_PROC_LOCK_MSGQ);
+ 	reds += erts_move_messages_off_heap(c_p);
+     }
+-    c_p->flags &= ~F_OFF_HEAP_MSGQ_CHNG;
++    c_p->sig_qs.flags &= ~FS_OFF_HEAP_MSGQ_CHNG;
+     return reds;
+ }
+ 
+@@ -1038,12 +1038,12 @@ erts_change_message_queue_management(Process *c_p, Eterm new_state)
+     Eterm res;
+ 
+ #ifdef DEBUG
+-    if (c_p->flags & F_OFF_HEAP_MSGQ) {
++    if (c_p->sig_qs.flags & FS_OFF_HEAP_MSGQ) {
+ 	ASSERT(erts_atomic32_read_nob(&c_p->state)
+ 	       & ERTS_PSFLG_OFF_HEAP_MSGQ);
+     }
+     else {
+-	if (c_p->flags & F_OFF_HEAP_MSGQ_CHNG) {
++	if (c_p->sig_qs.flags & FS_OFF_HEAP_MSGQ_CHNG) {
+ 	    ASSERT(erts_atomic32_read_nob(&c_p->state)
+ 		   & ERTS_PSFLG_OFF_HEAP_MSGQ);
+ 	}
+@@ -1054,23 +1054,23 @@ erts_change_message_queue_management(Process *c_p, Eterm new_state)
+     }
+ #endif
+ 
+-    switch (c_p->flags & (F_OFF_HEAP_MSGQ|F_ON_HEAP_MSGQ)) {
++    switch (c_p->sig_qs.flags & (FS_OFF_HEAP_MSGQ|FS_ON_HEAP_MSGQ)) {
+ 
+-    case F_OFF_HEAP_MSGQ:
++    case FS_OFF_HEAP_MSGQ:
+ 	res = am_off_heap;
+ 
+ 	switch (new_state) {
+ 	case am_off_heap:
+ 	    break;
+ 	case am_on_heap:
+-	    c_p->flags |= F_ON_HEAP_MSGQ;
+-	    c_p->flags &= ~F_OFF_HEAP_MSGQ;
++	    c_p->sig_qs.flags |= FS_ON_HEAP_MSGQ;
++	    c_p->sig_qs.flags &= ~FS_OFF_HEAP_MSGQ;
+ 	    /*
+ 	     * We are not allowed to clear ERTS_PSFLG_OFF_HEAP_MSGQ
+ 	     * if a off heap change is ongoing. It will be adjusted
+ 	     * when the change completes...
+ 	     */
+-	    if (!(c_p->flags & F_OFF_HEAP_MSGQ_CHNG)) {
++	    if (!(c_p->sig_qs.flags & FS_OFF_HEAP_MSGQ_CHNG)) {
+ 		/* Safe to clear ERTS_PSFLG_OFF_HEAP_MSGQ... */
+ 		erts_atomic32_read_band_nob(&c_p->state,
+ 						~ERTS_PSFLG_OFF_HEAP_MSGQ);
+@@ -1082,14 +1082,14 @@ erts_change_message_queue_management(Process *c_p, Eterm new_state)
+ 	}
+ 	break;
+ 
+-    case F_ON_HEAP_MSGQ:
++    case FS_ON_HEAP_MSGQ:
+ 	res = am_on_heap;
+ 
+ 	switch (new_state) {
+ 	case am_on_heap:
+ 	    break;
+ 	case am_off_heap:
+-	    c_p->flags &= ~F_ON_HEAP_MSGQ;
++	    c_p->sig_qs.flags &= ~FS_ON_HEAP_MSGQ;
+ 	    goto change_to_off_heap;
+ 	default:
+ 	    res = THE_NON_VALUE; /* badarg */
+@@ -1107,13 +1107,13 @@ erts_change_message_queue_management(Process *c_p, Eterm new_state)
+ 
+ change_to_off_heap:
+ 
+-    c_p->flags |= F_OFF_HEAP_MSGQ;
++    c_p->sig_qs.flags |= FS_OFF_HEAP_MSGQ;
+ 
+     /*
+      * We do not have to schedule a change if
+      * we have an ongoing off heap change...
+      */
+-    if (!(c_p->flags & F_OFF_HEAP_MSGQ_CHNG)) {
++    if (!(c_p->sig_qs.flags & FS_OFF_HEAP_MSGQ_CHNG)) {
+ 	ErtsChangeOffHeapMessageQueue *cohmq;
+ 	/*
+ 	 * Need to set ERTS_PSFLG_OFF_HEAP_MSGQ and wait
+@@ -1125,7 +1125,7 @@ change_to_off_heap:
+ 	 */
+ 	erts_atomic32_read_bor_nob(&c_p->state,
+ 				       ERTS_PSFLG_OFF_HEAP_MSGQ);
+-	c_p->flags |= F_OFF_HEAP_MSGQ_CHNG;
++	c_p->sig_qs.flags |= FS_OFF_HEAP_MSGQ_CHNG;
+ 	cohmq = erts_alloc(ERTS_ALC_T_MSGQ_CHNG,
+ 			   sizeof(ErtsChangeOffHeapMessageQueue));
+ 	cohmq->pid = c_p->common.id;
+diff --git a/erts/emulator/beam/erl_message.h b/erts/emulator/beam/erl_message.h
+index 5396eaef7c..3949396d60 100644
+--- a/erts/emulator/beam/erl_message.h
++++ b/erts/emulator/beam/erl_message.h
+@@ -298,6 +298,7 @@ typedef struct {
+     /* Common for inner and middle queue */
+     ErtsMessage **saved_last;	/* saved last pointer */
+     Sint len; /* NOT message queue length (see above) */
++    Uint32 flags;
+ } ErtsSignalPrivQueues;
+ 
+ typedef struct {
+@@ -325,18 +326,18 @@ typedef struct erl_trace_message_queue__ {
+         erts_proc_unlock((P), ERTS_PROC_LOCK_MSGQ);                     \
+         if ((P)->sig_qs.cont) {                                         \
+             (P)->sig_qs.saved_last = (P)->sig_qs.cont_last;             \
+-            (P)->flags |= F_DEFERRED_SAVED_LAST;                        \
++            (P)->sig_qs.flags |= FS_DEFERRED_SAVED_LAST;                \
+         }                                                               \
+         else {                                                          \
+             (P)->sig_qs.saved_last = (P)->sig_qs.last;                  \
+-            (P)->flags &= ~F_DEFERRED_SAVED_LAST;                       \
++            (P)->sig_qs.flags &= ~FS_DEFERRED_SAVED_LAST;               \
+         }                                                               \
+     } while (0)
+ 
+ #define ERTS_RECV_MARK_SET(P)                                           \
+     do {                                                                \
+         if ((P)->sig_qs.saved_last) {                                   \
+-            if ((P)->flags & F_DEFERRED_SAVED_LAST) {                   \
++            if ((P)->sig_qs.flags & FS_DEFERRED_SAVED_LAST) {           \
+                 /* Points to middle queue; use end of inner */          \
+                 /* This is later used by erts_proc_sig_handle_incoming */\
+                 /* to set the save to the correct place */              \
+@@ -353,7 +354,7 @@ typedef struct erl_trace_message_queue__ {
+ #define ERTS_RECV_MARK_CLEAR(P)                                         \
+     do {                                                                \
+         (P)->sig_qs.saved_last = NULL;                                  \
+-        (P)->flags &= ~F_DEFERRED_SAVED_LAST;                           \
++        (P)->sig_qs.flags &= ~FS_DEFERRED_SAVED_LAST;                   \
+     } while (0)
+ 
+ 
+diff --git a/erts/emulator/beam/erl_proc_sig_queue.c b/erts/emulator/beam/erl_proc_sig_queue.c
+index 47351ed63a..e236646005 100644
+--- a/erts/emulator/beam/erl_proc_sig_queue.c
++++ b/erts/emulator/beam/erl_proc_sig_queue.c
+@@ -859,7 +859,7 @@ erts_proc_sig_fetch_msgq_len_offs__(Process *proc)
+     if (marker->common.next) {
+         Sint len;
+ 
+-        proc->flags |= F_DELAYED_PSIGQS_LEN;
++        proc->sig_qs.flags |= FS_DELAYED_PSIGQS_LEN;
+ 
+         /*
+          * Prevent update of sig_qs.len in fetch. These
+@@ -906,7 +906,7 @@ proc_sig_privqs_len(Process *c_p, int have_qlock)
+                       == ((ERTS_PROC_LOCK_MSGQ|ERTS_PROC_LOCK_MAIN)
+                           & erts_proc_lc_my_proc_locks(c_p))));
+ 
+-    if (c_p->flags & F_DELAYED_PSIGQS_LEN) {
++    if (c_p->sig_qs.flags & FS_DELAYED_PSIGQS_LEN) {
+         ErtsProcSigMsgQLenOffsetMarker *marker;
+ 
+         if (!have_qlock)
+@@ -2738,7 +2738,7 @@ destroy_process_info_request(Process *c_p, ErtsProcessInfoSig *pisig)
+         erts_proc_unlock(c_p, ERTS_PROC_LOCK_MSGQ);
+ 
+         if (!refc) {
+-            c_p->flags &= ~F_DELAYED_PSIGQS_LEN;
++            c_p->sig_qs.flags &= ~FS_DELAYED_PSIGQS_LEN;
+             /* Adjust msg len of inner+middle queue */
+             ASSERT(marker->len_offset <= 0);
+             c_p->sig_qs.len -= marker->len_offset;
+@@ -3596,7 +3596,7 @@ erts_proc_sig_handle_incoming(Process *c_p, erts_aint32_t *statep,
+ stop: {
+         int deferred_save, deferred_saved_last, res;
+ 
+-        deferred_saved_last = !!(c_p->flags & F_DEFERRED_SAVED_LAST);
++        deferred_saved_last = !!(c_p->sig_qs.flags & FS_DEFERRED_SAVED_LAST);
+         deferred_save = 0;
+ 
+         if (!deferred_saved_last)
+@@ -3604,7 +3604,7 @@ stop: {
+         else {
+             if (c_p->sig_qs.saved_last == &c_p->sig_qs.cont) {
+                 c_p->sig_qs.saved_last = c_p->sig_qs.last;
+-                c_p->flags &= ~F_DEFERRED_SAVED_LAST;
++                c_p->sig_qs.flags &= ~FS_DEFERRED_SAVED_LAST;
+                 deferred_saved_last = deferred_save = 0;
+             }
+             else {
+@@ -3716,7 +3716,7 @@ stop: {
+         if (deferred_saved_last
+             && (c_p->sig_qs.saved_last == &c_p->sig_qs.cont)) {
+             c_p->sig_qs.saved_last = c_p->sig_qs.last;
+-            c_p->flags &= ~F_DEFERRED_SAVED_LAST;
++            c_p->sig_qs.flags &= ~FS_DEFERRED_SAVED_LAST;
+             if (deferred_save)
+                 c_p->sig_qs.save = c_p->sig_qs.saved_last;
+         }
+@@ -3727,7 +3727,7 @@ stop: {
+             }
+         }
+         else {
+-            c_p->flags &= ~F_DEFERRED_SAVED_LAST;
++            c_p->sig_qs.flags &= ~FS_DEFERRED_SAVED_LAST;
+             if (deferred_save)
+                 c_p->sig_qs.save = c_p->sig_qs.saved_last;
+         }
+@@ -3767,7 +3767,7 @@ stretch_limit(Process *c_p, ErtsSigRecvTracing *tp,
+     if (abs_lim == lim)
+         return 0;
+ 
+-    if (!(c_p->flags & F_DEFERRED_SAVED_LAST)) {
++    if (!(c_p->sig_qs.flags & FS_DEFERRED_SAVED_LAST)) {
+         ErtsSignal *sig;
+ 
+         if (PEEK_MESSAGE(c_p))
+@@ -4461,7 +4461,7 @@ erts_proc_sig_prep_msgq_for_inspection(Process *c_p,
+ 
+     ASSERT(!info_on_self || c_p == rp);
+ 
+-    self_on_heap = info_on_self && !(c_p->flags & F_OFF_HEAP_MSGQ);
++    self_on_heap = info_on_self && !(c_p->sig_qs.flags & FS_OFF_HEAP_MSGQ);
+ 
+     tot_heap_size = 0;
+     i = 0;
+@@ -4934,16 +4934,16 @@ proc_sig_hdbg_check_queue(Process *proc,
+         ERTS_ASSERT(!found_save);
+         if (!found_saved_last_p) {
+             ERTS_ASSERT(!found_saved_last
+-                        || (proc->flags & F_DEFERRED_SAVED_LAST));
++                        || (proc->sig_qs.flags & FS_DEFERRED_SAVED_LAST));
+         }
+         else {
+             if (*found_saved_last_p) {
+                 ERTS_ASSERT(!found_saved_last);
+-                ERTS_ASSERT(!(proc->flags & F_DEFERRED_SAVED_LAST));
++                ERTS_ASSERT(!(proc->sig_qs.flags & FS_DEFERRED_SAVED_LAST));
+             }
+             else if (saved_last) {
+                 ERTS_ASSERT(found_saved_last);
+-                ERTS_ASSERT(proc->flags & F_DEFERRED_SAVED_LAST);
++                ERTS_ASSERT(proc->sig_qs.flags & FS_DEFERRED_SAVED_LAST);
+             }
+             *found_saved_last_p |= found_saved_last;
+         }
+@@ -4955,7 +4955,7 @@ proc_sig_hdbg_check_queue(Process *proc,
+         ERTS_ASSERT(found_save);
+         ERTS_ASSERT(!saved_last
+                     || (found_saved_last
+-                        || (proc->flags & F_DEFERRED_SAVED_LAST)));
++                        || (proc->sig_qs.flags & FS_DEFERRED_SAVED_LAST)));
+         if (found_saved_last_p)
+             *found_saved_last_p |= found_saved_last;
+     }
+diff --git a/erts/emulator/beam/erl_process.c b/erts/emulator/beam/erl_process.c
+index 73dc8aa040..990c1ff914 100644
+--- a/erts/emulator/beam/erl_process.c
++++ b/erts/emulator/beam/erl_process.c
+@@ -9793,7 +9793,7 @@ Process *erts_schedule(ErtsSchedulerData *esdp, Process *p, int calls)
+         if (is_normal_sched) {
+             if (state & ERTS_PSFLG_RUNNING_SYS) {
+                 if (state & (ERTS_PSFLG_SIG_Q|ERTS_PSFLG_SIG_IN_Q)) {
+-                    int local_only = (!!(p->flags & F_LOCAL_SIGS_ONLY)
++                    int local_only = (!!(p->sig_qs.flags & FS_LOCAL_SIGS_ONLY)
+                                       & !(state & (ERTS_PSFLG_SUSPENDED|ERTS_PSFLGS_DIRTY_WORK)));
+                     if (!local_only | !!(state & ERTS_PSFLG_SIG_Q)) {
+                         int sig_reds;
+@@ -11391,7 +11391,7 @@ erl_create_process(Process* parent, /* Parent of process (default group leader).
+ 		   ErlSpawnOpts* so) /* Options for spawn. */
+ {
+     int bound = 0;
+-    Uint flags = 0;
++    Uint flags = 0, qs_flags = 0;
+     ErtsRunQueue *rq = NULL;
+     Process *p;
+     Sint arity;			/* Number of arguments. */
+@@ -11437,13 +11437,13 @@ erl_create_process(Process* parent, /* Parent of process (default group leader).
+ 
+     if (so->flags & SPO_OFF_HEAP_MSGQ) {
+ 	state |= ERTS_PSFLG_OFF_HEAP_MSGQ;
+-	flags |= F_OFF_HEAP_MSGQ;
++	qs_flags |= FS_OFF_HEAP_MSGQ;
+     }
+     else if (so->flags & SPO_ON_HEAP_MSGQ) {
+-	flags |= F_ON_HEAP_MSGQ;
++	qs_flags |= FS_ON_HEAP_MSGQ;
+     }
+ 
+-    ASSERT((flags & F_ON_HEAP_MSGQ) || (flags & F_OFF_HEAP_MSGQ));
++    ASSERT((qs_flags & FS_ON_HEAP_MSGQ) || (qs_flags & FS_OFF_HEAP_MSGQ));
+ 
+     if (!rq)
+ 	rq = erts_get_runq_proc(parent, NULL);
+@@ -11465,6 +11465,7 @@ erl_create_process(Process* parent, /* Parent of process (default group leader).
+     heap_need = arg_size;
+ 
+     p->flags = flags;
++    p->sig_qs.flags = qs_flags;
+ 
+     p->static_flags = 0;
+     if (so->flags & SPO_SYSTEM_PROC)
+diff --git a/erts/emulator/beam/erl_process.h b/erts/emulator/beam/erl_process.h
+index 54ed1e1d47..eb54df41c2 100644
+--- a/erts/emulator/beam/erl_process.h
++++ b/erts/emulator/beam/erl_process.h
+@@ -1423,26 +1423,28 @@ extern int erts_system_profile_ts_type;
+ #define F_ETS_SUPER_USER     (1 <<  9) /* Process is ETS super user */
+ #define F_FORCE_GC           (1 << 10) /* Force gc at process in-scheduling */
+ #define F_DISABLE_GC         (1 << 11) /* Disable GC (see below) */
+-#define F_OFF_HEAP_MSGQ      (1 << 12) /* Off heap msg queue */
+-#define F_ON_HEAP_MSGQ       (1 << 13) /* On heap msg queue */
+-#define F_OFF_HEAP_MSGQ_CHNG (1 << 14) /* Off heap msg queue changing */
+-#define F_ABANDONED_HEAP_USE (1 << 15) /* Have usage of abandoned heap */
+-#define F_DELAY_GC           (1 << 16) /* Similar to disable GC (see below) */
+-#define F_SCHDLR_ONLN_WAITQ  (1 << 17) /* Process enqueued waiting to change schedulers online */
+-#define F_HAVE_BLCKD_NMSCHED (1 << 18) /* Process has blocked normal multi-scheduling */
+-#define F_HIPE_MODE          (1 << 19) /* Process is executing in HiPE mode */
+-#define F_DELAYED_DEL_PROC   (1 << 20) /* Delay delete process (dirty proc exit case) */
+-#define F_DIRTY_CLA          (1 << 21) /* Dirty copy literal area scheduled */
+-#define F_DIRTY_GC_HIBERNATE (1 << 22) /* Dirty GC hibernate scheduled */
+-#define F_DIRTY_MAJOR_GC     (1 << 23) /* Dirty major GC scheduled */
+-#define F_DIRTY_MINOR_GC     (1 << 24) /* Dirty minor GC scheduled */
+-#define F_HIBERNATED         (1 << 25) /* Hibernated */
+-#define F_LOCAL_SIGS_ONLY    (1 << 26) /* Handle privq sigs only */
+-#define F_TRAP_EXIT          (1 << 27) /* Trapping exit */
+-#define F_DEFERRED_SAVED_LAST (1 << 28) /* Deferred sig_qs.saved_last */
+-#define F_DELAYED_PSIGQS_LEN (1 << 29) /* Delayed update of sig_qs.len */
+-#define F_HIPE_RECV_LOCKED   (1 << 30) /* HiPE message queue locked */
+-#define F_HIPE_RECV_YIELD    (1 << 31) /* HiPE receive yield */
++#define F_ABANDONED_HEAP_USE (1 << 12) /* Have usage of abandoned heap */
++#define F_DELAY_GC           (1 << 13) /* Similar to disable GC (see below) */
++#define F_SCHDLR_ONLN_WAITQ  (1 << 14) /* Process enqueued waiting to change schedulers online */
++#define F_HAVE_BLCKD_NMSCHED (1 << 15) /* Process has blocked normal multi-scheduling */
++#define F_HIPE_MODE          (1 << 16) /* Process is executing in HiPE mode */
++#define F_DELAYED_DEL_PROC   (1 << 17) /* Delay delete process (dirty proc exit case) */
++#define F_DIRTY_CLA          (1 << 18) /* Dirty copy literal area scheduled */
++#define F_DIRTY_GC_HIBERNATE (1 << 19) /* Dirty GC hibernate scheduled */
++#define F_DIRTY_MAJOR_GC     (1 << 20) /* Dirty major GC scheduled */
++#define F_DIRTY_MINOR_GC     (1 << 21) /* Dirty minor GC scheduled */
++#define F_HIBERNATED         (1 << 22) /* Hibernated */
++#define F_TRAP_EXIT          (1 << 23) /* Trapping exit */
++
++/* Signal queue flags */
++#define FS_OFF_HEAP_MSGQ       (1 << 0) /* Off heap msg queue */
++#define FS_ON_HEAP_MSGQ        (1 << 1) /* On heap msg queue */
++#define FS_OFF_HEAP_MSGQ_CHNG  (1 << 2) /* Off heap msg queue changing */
++#define FS_LOCAL_SIGS_ONLY     (1 << 3) /* Handle privq sigs only */
++#define FS_DEFERRED_SAVED_LAST (1 << 4) /* Deferred sig_qs.saved_last */
++#define FS_DELAYED_PSIGQS_LEN  (1 << 6) /* Delayed update of sig_qs.len */
++#define FS_HIPE_RECV_LOCKED    (1 << 7) /* HiPE message queue locked */
++#define FS_HIPE_RECV_YIELD     (1 << 8) /* HiPE receive yield */
+ 
+ /*
+  * F_DISABLE_GC and F_DELAY_GC are similar. Both will prevent
+diff --git a/erts/emulator/hipe/hipe_mode_switch.c b/erts/emulator/hipe/hipe_mode_switch.c
+index 052cf9c263..1cc25a3cf0 100644
+--- a/erts/emulator/hipe/hipe_mode_switch.c
++++ b/erts/emulator/hipe/hipe_mode_switch.c
+@@ -490,20 +490,20 @@ Process *hipe_mode_switch(Process *p, unsigned cmd, Eterm reg[])
+ 	  /* same semantics, different debug trace messages */
+ 	  /* XXX: BEAM has different entries for the locked and unlocked
+ 	     cases. HiPE doesn't, so we must check dynamically. */
+-	  if (p->flags & F_HIPE_RECV_LOCKED)
+-	      p->flags &= ~F_HIPE_RECV_LOCKED;
++	  if (p->sig_qs.flags & FS_HIPE_RECV_LOCKED)
++	      p->sig_qs.flags &= ~FS_HIPE_RECV_LOCKED;
+ 	  else
+ 	      erts_proc_lock(p, ERTS_PROC_LOCKS_MSG_RECEIVE);
+ 	  p->i = hipe_beam_pc_resume;
+ 	  p->arity = 0;
+           if (erts_atomic32_read_nob(&p->state) & ERTS_PSFLG_EXITING)
+               ASSERT(erts_atomic32_read_nob(&p->state) & ERTS_PSFLG_ACTIVE);
+-          else if (!(p->flags & F_HIPE_RECV_YIELD))
++          else if (!(p->sig_qs.flags & FS_HIPE_RECV_YIELD))
+               erts_atomic32_read_band_relb(&p->state, ~ERTS_PSFLG_ACTIVE);
+           else {
+               /* Yielded from receive */
+               ERTS_VBUMP_ALL_REDS(p);
+-              p->flags &= ~F_HIPE_RECV_YIELD;
++              p->sig_qs.flags &= ~FS_HIPE_RECV_YIELD;
+           }
+ 	  erts_proc_unlock(p, ERTS_PROC_LOCKS_MSG_RECEIVE);
+       do_schedule:
+@@ -527,7 +527,7 @@ Process *hipe_mode_switch(Process *p, unsigned cmd, Eterm reg[])
+ 	      p = erts_schedule(NULL, p, reds_in - p->fcalls);
+ 	      ERTS_REQ_PROC_MAIN_LOCK(p);
+ 	      ASSERT(!(p->flags & F_HIPE_MODE));
+-	      p->flags &= ~F_HIPE_RECV_LOCKED;
++	      p->sig_qs.flags &= ~FS_HIPE_RECV_LOCKED;
+ 	      reg = p->scheduler_data->x_reg_array;
+ 	  }
+ 	  {
+diff --git a/erts/emulator/hipe/hipe_native_bif.c b/erts/emulator/hipe/hipe_native_bif.c
+index 80e5d81023..7eebc15b2c 100644
+--- a/erts/emulator/hipe/hipe_native_bif.c
++++ b/erts/emulator/hipe/hipe_native_bif.c
+@@ -144,8 +144,8 @@ BIF_RETTYPE nbif_impl_hipe_set_timeout(NBIF_ALIST_1)
+     else {
+ 	int tres = erts_set_proc_timer_term(p, timeout_value);
+ 	if (tres != 0) { /* Wrong time */
+-	    if (p->flags & F_HIPE_RECV_LOCKED) {
+-                p->flags &= ~F_HIPE_RECV_LOCKED;
++	    if (p->sig_qs.flags & FS_HIPE_RECV_LOCKED) {
++                p->sig_qs.flags &= ~FS_HIPE_RECV_LOCKED;
+ 		erts_proc_unlock(p, ERTS_PROC_LOCKS_MSG_RECEIVE);
+ 	    }
+ 	    BIF_ERROR(p, EXC_TIMEOUT_VALUE);
+@@ -555,7 +555,7 @@ Eterm hipe_check_get_msg(Process *c_p)
+         if (!msgp) {
+             if (get_out) {
+                 if (get_out < 0)
+-                    c_p->flags |= F_HIPE_RECV_YIELD; /* yield... */
++                    c_p->sig_qs.flags |= FS_HIPE_RECV_YIELD; /* yield... */
+                 /* else: go exit... */
+                 return THE_NON_VALUE;
+             }
+@@ -568,7 +568,7 @@ Eterm hipe_check_get_msg(Process *c_p)
+              */
+ 
+             /* XXX: BEAM doesn't need this */
+-            c_p->flags |= F_HIPE_RECV_LOCKED;
++            c_p->sig_qs.flags |= FS_HIPE_RECV_LOCKED;
+             c_p->flags &= ~F_DELAY_GC;
+             return THE_NON_VALUE;
+         }
+@@ -613,8 +613,8 @@ void hipe_clear_timeout(Process *c_p)
+      */
+     /* XXX: BEAM has different entries for the locked and unlocked
+        cases. HiPE doesn't, so we must check dynamically. */
+-    if (c_p->flags & F_HIPE_RECV_LOCKED) {
+-	c_p->flags &= ~F_HIPE_RECV_LOCKED;
++    if (c_p->sig_qs.flags & FS_HIPE_RECV_LOCKED) {
++	c_p->sig_qs.flags &= ~FS_HIPE_RECV_LOCKED;
+ 	erts_proc_unlock(c_p, ERTS_PROC_LOCKS_MSG_RECEIVE);
+     }
+     if (IS_TRACED_FL(c_p, F_TRACE_RECEIVE)) {
+diff --git a/erts/etc/unix/etp-commands.in b/erts/etc/unix/etp-commands.in
+index 716fafdf2b..88291b9d31 100644
+--- a/erts/etc/unix/etp-commands.in
++++ b/erts/etc/unix/etp-commands.in
+@@ -1359,13 +1359,64 @@ define etp-sigq-int
+   printf "    Non-message signals: %d\n\n", $etp_sigq_nmsig_len
+ end
+ 
++define etp-sigq-flags-int
++# Args: int
++#
++  if ($arg0 & ~((1 << 9)-1))
++    printf "GARBAGE<%x> ", ($arg0 & ~((1 << 9)-1))
++  end
++  if ($arg0 & (1 << 8))
++    printf "hipe-receive-yield "
++  end
++  if ($arg0 & (1 << 7))
++    printf "hipe-receive-locked "
++  end
++  if ($arg0 & (1 << 6))
++    printf "delayed-sigq-len "
++  end
++  if ($arg0 & (1 << 4))
++    printf "deferred-saved-last "
++  end
++  if ($arg0 & (1 << 3))
++    printf "local-signals-only "
++  end
++  if ($arg0 & (1 << 2))
++    printf "offheap-msgq-changing "
++  end
++  if ($arg0 & (1 << 1))
++    printf "on-heap "
++  end
++  if ($arg0 & (1 << 0))
++    printf "off-heap "
++  end
++  printf "\n"
++end
++
++define etp-sigq-flags
++# Args: Process*
++#
++  set $flags_int = ((Process *) $arg0)->sig_qs.flags
++  etp-sigq-flags-int $flags_int
++end
++
++document etp-sigq-flags
++%---------------------------------------------------------------------------
++% etp-sigqs-flags Process*
++%
++% Print the signal queue flags of process
++%---------------------------------------------------------------------------
++end
++
+ define etp-sigqs
++  set $proc_int = ((Process*)($arg0))
++  printf "  Msgq Flags: "
++  etp-sigq-flags $proc_int
+   printf "  --- Inner signal queue (message queue) ---\n"
+-  etp-sigq-int ($arg0)->sig_qs.first ($arg0)->sig_qs.save ($arg0)->sig_qs.saved_last
++  etp-sigq-int ($proc_int)->sig_qs.first ($proc_int)->sig_qs.save ($proc_int)->sig_qs.saved_last
+   printf "  --- Middle signal queue ---\n"
+-  etp-sigq-int ($arg0)->sig_qs.cont ($arg0)->sig_qs.save ($arg0)->sig_qs.saved_last
++  etp-sigq-int ($proc_int)->sig_qs.cont ($proc_int)->sig_qs.save ($proc_int)->sig_qs.saved_last
+   printf "  --- Outer queue ---\n"
+-  etp-sigq-int ($arg0)->sig_inq.first ($arg0)->sig_qs.save ($arg0)->sig_qs.saved_last
++  etp-sigq-int ($proc_int)->sig_inq.first ($proc_int)->sig_qs.save ($proc_int)->sig_qs.saved_last
+ end
+ 
+ define etp-msgq
+@@ -2037,91 +2088,79 @@ end
+ define etp-proc-flags-int
+ # Args: int
+ #
+-  if ($arg0 & ~0xfffffff)
+-    printf "GARBAGE<%x> ", ($arg0 & ~0x1ffffff)
++  if ($arg0 & ~((1 << 24)-1))
++    printf "GARBAGE<%x> ", ($arg0 & ~((1 << 24)-1))
+   end
+-  if ($arg0 & 0x8000000)
++  if ($arg0 & (1 << 23))
+     printf "trap-exit "
+   end
+-  if ($arg0 & 0x4000000)
+-    printf "local-sigs-only "
+-  end
+-  if ($arg0 & 0x2000000)
++  if ($arg0 & (1 << 22))
+     printf "hibernated "
+   end
+-  if ($arg0 & 0x1000000)
++  if ($arg0 & (1 << 21))
+     printf "dirty-minor-gc "
+   end
+-  if ($arg0 & 0x800000)
++  if ($arg0 & (1 << 20))
+     printf "dirty-major-gc "
+   end
+-  if ($arg0 & 0x400000)
++  if ($arg0 & (1 << 19))
+     printf "dirty-gc-hibernate "
+   end
+-  if ($arg0 & 0x200000)
++  if ($arg0 & (1 << 18))
+     printf "dirty-cla "
+   end
+-  if ($arg0 & 0x100000)
++  if ($arg0 & (1 << 17))
+     printf "delayed-del-proc "
+   end
+-  if ($arg0 & 0x80000)
++  if ($arg0 & (1 << 16))
+     printf "hipe-mode "
+   end
+-  if ($arg0 & 0x40000)
++  if ($arg0 & (1 << 15))
+     printf "have-blocked-nmsb "
+   end
+-  if ($arg0 & 0x20000)
++  if ($arg0 & (1 << 14))
+     printf "shdlr-onln-wait-q "
+   end
+-  if ($arg0 & 0x10000)
++  if ($arg0 & (1 << 13))
+     printf "delay-gc "
+   end
+-  if ($arg0 & 0x8000)
++  if ($arg0 & (1 << 12))
+     printf "abandoned-heap-use "
+   end
+-  if ($arg0 & 0x4000)
+-    printf "off-heap-msgq-chng "
+-  end
+-  if ($arg0 & 0x2000)
+-    printf "on-heap-msgq "
+-  end
+-  if ($arg0 & 0x1000)
+-    printf "off-heap-msgq "
+-  end
+-  if ($arg0 & 0x800)
++  if ($arg0 & (1 << 11))
+     printf "disable-gc "
+   end
+-  if ($arg0 & 0x400)
++  if ($arg0 & (1 << 10))
+     printf "force-gc "
+   end
+-  if ($arg0 & 0x200)
+-    printf "p2pnr-resched "
++  if ($arg0 & (1 << 9))
++    printf "ets-super-user "
+   end
+-  if ($arg0 & 0x100)
++  if ($arg0 & (1 << 8))
+     printf "have-blocked-msb "
+   end
+-  if ($arg0 & 0x80)
++  if ($arg0 & (1 << 7))
+     printf "using-ddll "
+   end
+-  if ($arg0 & 0x40)
++  if ($arg0 & (1 << 6))
+     printf "distribution "
+   end
+-  if ($arg0 & 0x20)
++  if ($arg0 & (1 << 5))
+     printf "using-db "
+   end
+-  if ($arg0 & 0x10)
++  if ($arg0 & (1 << 4))
+     printf "need-fullsweep "
+   end
+-  if ($arg0 & 0x8)
++  if ($arg0 & (1 << 3))
+     printf "heap-grow "
+   end
+-  if ($arg0 & 0x4)
++  if ($arg0 & (1 << 2))
+     printf "timo "
+   end
+-  if ($arg0 & 0x2)
++  if ($arg0 & (1 << 1))
+     printf "inslpqueue "
+   end
+-  if ($arg0 & 0x1)
++  if ($arg0 & (1 << 0))
+     printf "hibernate-sched "
+   end
+   printf "\n"
+-- 
+2.20.1
+

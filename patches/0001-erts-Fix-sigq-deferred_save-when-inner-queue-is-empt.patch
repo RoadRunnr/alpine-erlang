@@ -1,0 +1,53 @@
+From d72e521ad8ebed0e6f2ec4554a1857edf4abf91e Mon Sep 17 00:00:00 2001
+From: Lukas Larsson <lukas@erlang.org>
+Date: Tue, 29 Oct 2019 13:21:27 +0100
+Subject: [PATCH 1/6] erts: Fix sigq deferred_save when inner queue is empty
+
+If the inner queue is empty, the deferred_save would incorrectly
+trigger and set the message queue pointer to the wrong place.
+This commit makes it so that the message queue optimization does
+not trigger when the inner queue is empty. This is a correct
+solution, but not ideal as it means that the message queue optimization
+will not help when you have a huge middle queue but en empty
+inner queue.
+---
+ erts/emulator/beam/erl_message.h        | 2 ++
+ erts/emulator/beam/erl_proc_sig_queue.c | 9 ++++++++-
+ 2 files changed, 10 insertions(+), 1 deletion(-)
+
+diff --git a/erts/emulator/beam/erl_message.h b/erts/emulator/beam/erl_message.h
+index 5bd25737a7..5396eaef7c 100644
+--- a/erts/emulator/beam/erl_message.h
++++ b/erts/emulator/beam/erl_message.h
+@@ -338,6 +338,8 @@ typedef struct erl_trace_message_queue__ {
+         if ((P)->sig_qs.saved_last) {                                   \
+             if ((P)->flags & F_DEFERRED_SAVED_LAST) {                   \
+                 /* Points to middle queue; use end of inner */          \
++                /* This is later used by erts_proc_sig_handle_incoming */\
++                /* to set the save to the correct place */              \
+                 (P)->sig_qs.save = (P)->sig_qs.last;                    \
+                 ASSERT(!PEEK_MESSAGE((P)));                             \
+             }                                                           \
+diff --git a/erts/emulator/beam/erl_proc_sig_queue.c b/erts/emulator/beam/erl_proc_sig_queue.c
+index 0a7d499bc4..47351ed63a 100644
+--- a/erts/emulator/beam/erl_proc_sig_queue.c
++++ b/erts/emulator/beam/erl_proc_sig_queue.c
+@@ -3608,7 +3608,14 @@ stop: {
+                 deferred_saved_last = deferred_save = 0;
+             }
+             else {
+-                if (c_p->sig_qs.save == c_p->sig_qs.last)
++                if (c_p->sig_qs.save == c_p->sig_qs.last &&
++                    c_p->sig_qs.save != &c_p->sig_qs.first)
++                    /* When save is set to last AND DEFERRED_SAVED_LAST is
++                       set we know that we have done a ERTS_RECV_MARK_SET
++                       to the last in order to trigger a clean of the middle
++                       queue. However, we cannot know this when there
++                       are no messages in the inner queue, so in that
++                       case we have to parse the entire queue again */
+                     deferred_save = !0;
+                 else
+                     deferred_save = 0;
+-- 
+2.20.1
+

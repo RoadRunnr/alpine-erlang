@@ -1,0 +1,28 @@
+From e84c6a8d177f0e5e2fe27c479553ec4c7e1c0ff2 Mon Sep 17 00:00:00 2001
+From: Lukas Larsson <lukas@erlang.org>
+Date: Tue, 29 Oct 2019 15:36:04 +0100
+Subject: [PATCH 2/6] erts: Change process->flags to be 32-bit
+
+The flags field must work on bith 32 and 64 bit,
+so we can max have 32 values in the flags.
+---
+ erts/emulator/beam/erl_process.h | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/erts/emulator/beam/erl_process.h b/erts/emulator/beam/erl_process.h
+index a0aec06208..54ed1e1d47 100644
+--- a/erts/emulator/beam/erl_process.h
++++ b/erts/emulator/beam/erl_process.h
+@@ -985,8 +985,8 @@ struct process {
+     Uint32 rcount;		/* suspend count */
+     int  schedule_count;	/* Times left to reschedule a low prio process */
+     Uint reds;			/* No of reductions for this process  */
++    Uint32 flags;		/* Trap exit, etc */
+     Eterm group_leader;		/* Pid in charge (can be boxed) */
+-    Uint flags;			/* Trap exit, etc (no trace flags anymore) */
+     Eterm fvalue;		/* Exit & Throw value (failure reason) */
+     Uint freason;		/* Reason for detected failure */
+     Eterm ftrace;		/* Latest exception stack trace dump */
+-- 
+2.20.1
+

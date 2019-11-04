@@ -1,0 +1,24 @@
+From 9a91d4b23427c63ef72b75a422e695216a56877c Mon Sep 17 00:00:00 2001
+From: Lukas Larsson <lukas@erlang.org>
+Date: Thu, 31 Oct 2019 12:27:28 +0100
+Subject: [PATCH 6/6] fixup! erts: Optimize deferred save message queue pointer
+
+---
+ erts/emulator/beam/erl_message.h | 1 -
+ 1 file changed, 1 deletion(-)
+
+diff --git a/erts/emulator/beam/erl_message.h b/erts/emulator/beam/erl_message.h
+index 40847d5945..38a2d567d3 100644
+--- a/erts/emulator/beam/erl_message.h
++++ b/erts/emulator/beam/erl_message.h
+@@ -339,7 +339,6 @@ typedef struct erl_trace_message_queue__ {
+         if ((P)->sig_qs.saved_last) {                                   \
+             if ((P)->sig_qs.flags & FS_DEFERRED_SAVED_LAST) {           \
+                 (P)->sig_qs.flags |= FS_DEFERRED_SAVE;                  \
+-                ASSERT(!PEEK_MESSAGE((P)));                             \
+             }                                                           \
+             else {                                                      \
+                 /* Points to inner queue; safe to use */                \
+-- 
+2.20.1
+
